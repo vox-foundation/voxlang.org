@@ -1,0 +1,5 @@
+# Typed allowlist for `vox ci check-links`: historical pointers where updating prose
+# would erase audit intent. Entries expire: past `expires`, entries fail (fatal expiry).
+# Unneeded entries (target resolves) and unused entries (not referenced) also fail.
+schema_version: 1
+allowlist: []
