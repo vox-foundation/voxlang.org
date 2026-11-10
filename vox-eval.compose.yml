@@ -1,0 +1,70 @@
+# Vox Eval Sandbox — Coolify deployment
+# Purpose: exposes /v1/eval to the public internet for the docs playground.
+# This is ONLY the HTTP gateway. It has no workspace, no AI keys, no mesh.
+# Secrets are injected as environment variables via Coolify's project secrets.
+#
+# Image SSOT: GHCR (built by .github/workflows/docker-eval.yml with VOX_CLI_FEATURES=mcp-server).
+# Published under the personal brbrainerd namespace, not vox-foundation: the
+# org's free-tier plan blocks changing container-package visibility, and
+# pull_policy: always below needs an anonymously-pullable public image.
+# Docs: docs/src/architecture/eval-sandbox-deployment.md
+
+name: vox-eval-sandbox
+
+services:
+  eval:
+    image: ghcr.io/brbrainerd/vox-eval:latest
+    pull_policy: always
+    container_name: vox-eval-sandbox
+    restart: unless-stopped
+    command: ["vox", "mcp"]
+    environment:
+      # Gateway on — bind to 0.0.0.0 so Coolify's Traefik can reach it
+      - VOX_MCP_HTTP_ENABLED=1
+      - VOX_MCP_HTTP_HOST=0.0.0.0
+      - VOX_MCP_HTTP_PORT=3921
+      # Public eval mode: no bearer token required for /v1/eval only
+      - VOX_MCP_HTTP_PUBLIC_EVAL_ENABLED=1
+      # Trust Coolify's Traefik for real IP (for per-IP rate limiting)
+      - VOX_MCP_HTTP_TRUST_X_FORWARDED_FOR=1
+      # HTTPS enforcement: Coolify terminates TLS, so X-Forwarded-Proto: https is set
+      - VOX_MCP_HTTP_REQUIRE_FORWARDED_HTTPS=1
+      # Lock down rate limit for anonymous playground callers (10/min per IP)
+      # Admin token below is for internal use only; never exposed to docs site
+      - VOX_MCP_HTTP_BEARER_TOKEN=${VOX_MCP_HTTP_BEARER_TOKEN}
+      # Bind policy (capability-profiles plan 04): a non-loopback bind needs both tokens and
+      # TLS or a tunnel attestation. Traefik terminates TLS for eval.voxlang.org.
+      - VOX_MCP_HTTP_READ_BEARER_TOKEN=${VOX_MCP_HTTP_READ_BEARER_TOKEN}
+      - VOX_MCP_HTTP_BEHIND_TUNNEL=1
+    ports:
+      # Only expose to Traefik, not to the public directly.
+      # Coolify will route eval.voxlang.org → container port 3921
+      - "3921"
+    labels:
+      # Coolify / Traefik routing labels
+      - "traefik.enable=true"
+      # HTTPS Router
+      - "traefik.http.routers.vox-eval.rule=Host(`eval.voxlang.org`)"
+      - "traefik.http.routers.vox-eval.entrypoints=https"
+      - "traefik.http.routers.vox-eval.tls=true"
+      - "traefik.http.routers.vox-eval.tls.certresolver=letsencrypt"
+      # HTTP Router (for redirect)
+      - "traefik.http.routers.vox-eval-http.rule=Host(`eval.voxlang.org`)"
+      - "traefik.http.routers.vox-eval-http.entrypoints=http"
+      - "traefik.http.routers.vox-eval-http.middlewares=redirect-to-https"
+      # Global redirect middleware (assumed to exist in Coolify's Traefik, otherwise we define it)
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+      - "traefik.http.services.vox-eval.loadbalancer.server.port=3921"
+      # CORS for GitHub Pages
+      - "traefik.http.middlewares.vox-eval-cors.headers.accesscontrolalloworiginlist=https://vox-lang.github.io,https://voxlang.org,http://localhost:4321"
+      - "traefik.http.middlewares.vox-eval-cors.headers.accesscontrolallowmethods=POST,OPTIONS"
+      - "traefik.http.middlewares.vox-eval-cors.headers.accesscontrolallowheaders=Content-Type,Authorization"
+      - "traefik.http.routers.vox-eval.middlewares=vox-eval-cors"
+      - com.centurylinklabs.watchtower.enable=true
+    healthcheck:
+      # Runtime image includes curl (Dockerfile); probes the MCP HTTP gateway directly.
+      test: ["CMD", "curl", "-f", "http://localhost:3921/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
