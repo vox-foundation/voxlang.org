@@ -1,0 +1,35 @@
+[package]
+name = "vox-doc-pipeline"
+description = "Documentation linter + corpus export for docs/src (Starlight owns sidebar/RSS generation)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vox-doc-pipeline"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+vox-bounded-fs = { workspace = true }
+vox-kb-facets = { workspace = true }
+vox-diagram = { workspace = true }
+workspace-hack = { version = "0.6", path = "../workspace-hack" }
+vox-compiler = { workspace = true }
+serde_json.workspace = true
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+pulldown-cmark = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+rayon = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

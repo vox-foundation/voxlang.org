@@ -1,0 +1,62 @@
+---
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(here, '..', '..', '..');
+const fixturesDir = join(repoRoot, 'contracts', 'scientia', 'fixtures', 'findings');
+
+function renderFindingHtml(pagePath: string): string {
+  const voxDevPs1 = join(repoRoot, 'scripts', 'windows', 'vox-dev.ps1');
+  const voxDevSh = join(repoRoot, 'scripts', 'vox-dev.sh');
+  const args = [
+    'scientia',
+    'publication-finding-page-render',
+    '--page',
+    pagePath,
+  ];
+
+  if (process.platform === 'win32' && existsSync(voxDevPs1)) {
+    return execFileSync(
+      'pwsh',
+      ['-NoProfile', '-File', voxDevPs1, ...args],
+      { encoding: 'utf8', cwd: repoRoot },
+    );
+  }
+  if (existsSync(voxDevSh)) {
+    return execFileSync('bash', [voxDevSh, ...args], {
+      encoding: 'utf8',
+      cwd: repoRoot,
+    });
+  }
+  throw new Error(
+    'Cannot render finding page: vox dev launcher not found (scripts/vox-dev.sh or scripts/windows/vox-dev.ps1)',
+  );
+}
+
+export async function getStaticPaths() {
+  // Recompute locally — Astro 6 extracts getStaticPaths into a separate prerender
+  // chunk where frontmatter-scope consts are not in scope.
+  const _here = dirname(fileURLToPath(import.meta.url));
+  const _repoRoot = join(_here, '..', '..', '..');
+  const _fixturesDir = join(_repoRoot, 'contracts', 'scientia', 'fixtures', 'findings');
+  if (!existsSync(_fixturesDir)) {
+    return [];
+  }
+  const files = readdirSync(_fixturesDir).filter((f) => f.endsWith('.json'));
+  return files.map((file) => {
+    const pagePath = join(_fixturesDir, file);
+    const page = JSON.parse(readFileSync(pagePath, 'utf8'));
+    return {
+      params: { uri: page.trusty_uri },
+      props: { pagePath },
+    };
+  });
+}
+
+const { pagePath } = Astro.props;
+const html = renderFindingHtml(pagePath);
+---
+<Fragment set:html={html} />

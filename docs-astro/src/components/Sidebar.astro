@@ -1,0 +1,66 @@
+---
+import type { Props } from '@astrojs/starlight/props';
+import Default from '@astrojs/starlight/components/Sidebar.astro';
+---
+
+<div class="vox-sidebar-toggle-container">
+  <button
+    id="vox-sidebar-pin-toggle"
+    class="vox-edge-toggle"
+    type="button"
+    aria-label="Hide navigation sidebar"
+    aria-expanded="true"
+    title="Hide navigation sidebar"
+  >
+    <svg class="vox-edge-icon-close" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M15 6 L9 12 L15 18" />
+    </svg>
+    <svg class="vox-edge-icon-open" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9 6 L15 12 L9 18" />
+    </svg>
+  </button>
+</div>
+
+<Default {...Astro.props}><slot /></Default>
+
+<script is:inline>
+  (function() {
+    function initSidebarToggle() {
+      var btn = document.getElementById('vox-sidebar-pin-toggle');
+      if (!btn) return;
+
+      function isClosed(state) {
+        return state === 'hidden' || state === 'collapsed';
+      }
+
+      function updateAria(state) {
+        var closed = isClosed(state);
+        btn.setAttribute('aria-expanded', closed ? 'false' : 'true');
+        btn.setAttribute('aria-label', closed ? 'Show navigation sidebar' : 'Hide navigation sidebar');
+        btn.setAttribute('title', closed ? 'Show navigation sidebar' : 'Hide navigation sidebar');
+      }
+
+      updateAria(document.documentElement.dataset.sidebarState || 'pinned');
+
+      if (btn.dataset.voxBound === 'true') return;
+      btn.dataset.voxBound = 'true';
+
+      btn.addEventListener('click', function() {
+        var closed = isClosed(document.documentElement.dataset.sidebarState);
+        var nextState = closed ? 'pinned' : 'hidden';
+        document.documentElement.dataset.sidebarState = nextState;
+        try {
+          localStorage.setItem('vox-sidebar-state', nextState);
+        } catch (e) {}
+        updateAria(nextState);
+      });
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initSidebarToggle);
+    } else {
+      initSidebarToggle();
+    }
+    document.addEventListener('astro:page-load', initSidebarToggle);
+  })();
+</script>

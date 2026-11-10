@@ -1,0 +1,39 @@
+---
+import Default from '@astrojs/starlight/components/Banner.astro';
+import { getFreshnessForPath } from '../utils/docs-freshness.mjs';
+
+const route = Astro.locals.starlightRoute;
+const entry = route?.entry;
+const sourcePath = entry?.data?._sourcePath;
+const isSplash = entry?.data?.template === 'splash' || !route?.id || route?.id === '' || route?.id === 'index';
+const freshness = !isSplash ? getFreshnessForPath(sourcePath, entry?.filePath) : null;
+---
+
+<!-- Render standard Starlight status banner if present (research, roadmap, deprecated, legacy) -->
+<Default {...Astro.props} />
+
+<!-- Render Trust Signal Banner only when actionable (drifting / broken / historical) to prevent Verified/Unverified banner spam -->
+{freshness && (freshness.state === 'drifting' || freshness.state === 'broken' || freshness.state === 'historical') && (
+  <div class={`vox-trust-banner vox-trust-${freshness.state}`} data-pagefind-ignore>
+    <div class="vox-trust-inner">
+      <span class="vox-trust-indicator" aria-hidden="true"></span>
+      <span class="vox-trust-text">
+        {freshness.state === 'drifting' && (
+          <>
+            <strong>May be out of date:</strong> Code changed since verification (at <code>{freshness.shortCommit}</code>).
+          </>
+        )}
+        {freshness.state === 'broken' && (
+          <>
+            <strong>Anchor drift detected:</strong> One or more code anchors on this page need synchronization.
+          </>
+        )}
+        {freshness.state === 'historical' && (
+          <>
+            <strong>Historical:</strong> Archived or legacy material preserved for historical context.
+          </>
+        )}
+      </span>
+    </div>
+  </div>
+)}

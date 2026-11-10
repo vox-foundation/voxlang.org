@@ -1,0 +1,965 @@
+//! Documentation linter for `docs/src/`. Checks frontmatter, code fences,
+//! training rationale, and embedded Vox doctests.
+//!
+//! Facet backlog tools (KB Phase 4, D-04): `--seed-facet-backlog --epoch-note <why>` writes
+//! `contracts/documentation/kb-facet-backlog.v1.yaml` from live violations (re-seeding is
+//! USER-AUTHORIZED-ONLY); `--tighten-facet-backlog` only removes rows and rule ids.
+
+pub mod anchors;
+mod diagrams;
+pub mod doctest;
+mod facet_backlog;
+mod facets;
+mod lint;
+pub mod mermaid;
+mod mermaid_base_gate;
+mod mermaid_gate;
+pub mod openwiki;
+pub mod openwiki_symbols;
+mod render_manifest;
+pub mod types;
+
+pub use diagrams::fence_issues;
+pub use facet_backlog::facet_backlog_gate_failures;
+pub use lint::{sync_readme_to_frontpage, transform_readme_block_for_mdx};
+pub use mermaid_base_gate::{Rename, mermaid_baseline_gate_failures};
+pub use mermaid_gate::MERMAID_BASELINE_REL;
+pub use vox_kb_facets::BACKLOG_REL as FACET_BACKLOG_REL;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lint::collect_lint_errors_target_with_root;
+use types::{LintError, LintKind};
+
+/// Render a `" Did you mean \"X\"?"` fragment (note the leading space) when a close
+/// valid value exists, or an empty string otherwise. Lets a rejected frontmatter
+/// value be fixed in one pass instead of guessing case/punctuation.
+fn suggestion_hint(value: &str, candidates: &[&str]) -> String {
+    match lint::suggest(value, candidates) {
+        Some(best) => format!(" Did you mean {best:?}?"),
+        None => String::new(),
+    }
+}
+
+/// One-line remediation hint per error kind. Printed in the grouped summary so a
+/// human — or a fan-out of fix agents — knows the canonical workflow for each class
+/// of failure without spelunking the linter source.
+fn workflow_for_kind(kind: &LintKind) -> &'static str {
+    match kind {
+        LintKind::UnknownCategory { .. } => {
+            "set `category:` to a canonical label (SSOT: contracts/documentation/docs-sidebar-section-order.v1.json)"
+        }
+        LintKind::UnknownStatus { .. } => "set `status:` to a canonical lifecycle value",
+        LintKind::UnknownSchemaType { .. } => "set `schema_type:` to a supported schema.org type",
+        LintKind::MissingFrontmatter | LintKind::MissingCategory => {
+            "add the YAML frontmatter block (title/description/category) — see AGENTS.md §Authored Markdown Frontmatter"
+        }
+        LintKind::MissingTrainingRationale => {
+            "add `training_rationale:` next to `training_eligible: true`"
+        }
+        LintKind::GenericDescription => {
+            "replace the template `description:` with a hand-written one"
+        }
+        LintKind::UnclosedCodeFence | LintKind::ShortCodeFence { .. } => {
+            "balance the ``` code fences (mdBook requires exactly 3 backticks)"
+        }
+        LintKind::UnlabeledCodeFence { .. } => "add a language tag to the ``` fence (e.g. ```bash)",
+        LintKind::DuplicateFrontmatter { .. } => {
+            "delete the second `---` frontmatter block (usually a merge accident)"
+        }
+        LintKind::BrokenIncludeFile { .. } | LintKind::BrokenIncludeAnchor { .. } => {
+            "fix the `{{#include}}` target path/anchor"
+        }
+        LintKind::WholeFileIncludeHasTrainingHeader { .. } => {
+            "use `{{#include file:display}}` to strip the `// ---` training header"
+        }
+        LintKind::DocTestFailed { .. } => {
+            "make the ```vox block compile, or annotate it `// vox:skip` with a reason"
+        }
+        LintKind::HandAuthoredLastUpdated => "remove the hand-authored last_updated key",
+        LintKind::HandAuthoredLastVerified => {
+            "remove hand-authored last_verified or last_verified_commit key"
+        }
+        LintKind::ReadmeSyncDrift { .. } => {
+            "re-sync the block with README.md, or fix the ANCHOR if content genuinely changed"
+        }
+        LintKind::ReadmeSyncMissingBlock { .. } => {
+            "add the matching SYNC-FROM-README block to index.mdx"
+        }
+        LintKind::ReadmeSyncMissingAnchor { .. } => "add the matching ANCHOR block to README.md",
+        LintKind::ReadmeSyncSourceMissing { .. } => {
+            "restore README.md and docs/src/index.mdx — the sync check can't run without both"
+        }
+        LintKind::Facet(i) => i.workflow(),
+        LintKind::Diagram(i) => i.workflow(),
+        LintKind::LegacyMermaid(i) => i.workflow(),
+        LintKind::InvalidMermaid { .. } => {
+            "quote special characters in Mermaid node/edge labels and balance subgraph/end blocks"
+        }
+    }
+}
+
+/// Stable short label for grouping errors by class in the summary.
+fn kind_label(kind: &LintKind) -> &'static str {
+    match kind {
+        LintKind::UnclosedCodeFence => "unclosed-code-fence",
+        LintKind::ShortCodeFence { .. } => "short-code-fence",
+        LintKind::GenericDescription => "generic-description",
+        LintKind::MissingFrontmatter => "missing-frontmatter",
+        LintKind::MissingCategory => "missing-category",
+        LintKind::MissingTrainingRationale => "missing-training-rationale",
+        LintKind::UnknownCategory { .. } => "unknown-category",
+        LintKind::UnknownStatus { .. } => "unknown-status",
+        LintKind::UnknownSchemaType { .. } => "unknown-schema-type",
+        LintKind::BrokenIncludeAnchor { .. } => "broken-include-anchor",
+        LintKind::BrokenIncludeFile { .. } => "broken-include-file",
+        LintKind::WholeFileIncludeHasTrainingHeader { .. } => "whole-file-include-training-header",
+        LintKind::DocTestFailed { .. } => "doctest-failed",
+        LintKind::UnlabeledCodeFence { .. } => "unlabeled-code-fence",
+        LintKind::DuplicateFrontmatter { .. } => "duplicate-frontmatter",
+        LintKind::HandAuthoredLastUpdated => "hand-authored-last-updated",
+        LintKind::HandAuthoredLastVerified => "hand-authored-last-verified",
+        LintKind::ReadmeSyncDrift { .. } => "readme-sync-drift",
+        LintKind::ReadmeSyncMissingBlock { .. } => "readme-sync-missing-block",
+        LintKind::ReadmeSyncMissingAnchor { .. } => "readme-sync-missing-anchor",
+        LintKind::ReadmeSyncSourceMissing { .. } => "readme-sync-source-missing",
+        LintKind::Facet(i) => i.rule_id(),
+        LintKind::Diagram(i) => i.rule_id(),
+        LintKind::LegacyMermaid(i) => i.rule_id(),
+        LintKind::InvalidMermaid { .. } => "invalid-mermaid",
+    }
+}
+
+/// Print a grouped, deduplicated summary of every error class with a remediation
+/// hint, so all failures can be fanned out and fixed in parallel.
+fn print_grouped_summary(errors: &[LintError]) {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<&'static str, (usize, &LintKind)> = BTreeMap::new();
+    for e in errors {
+        let entry = groups.entry(kind_label(&e.kind)).or_insert((0, &e.kind));
+        entry.0 += 1;
+    }
+    eprintln!(
+        "\n── summary: {} error(s) across {} class(es) ──",
+        errors.len(),
+        groups.len()
+    );
+    for (label, (count, sample)) in &groups {
+        eprintln!("  {count:>3}× {label:<34} → {}", workflow_for_kind(sample));
+    }
+}
+
+/// Resolve `--paths` / `--paths=` arguments relative to `docs_src`.
+///
+/// Returns `Ok(empty)` when the flag is absent (lint the whole tree).
+/// Returns `Err(missing)` when any resolved path does not exist — a silent empty
+/// match used to print a false green (e.g. `--paths docs/src/archive/foo.md`
+/// joined onto `docs/src/` → `docs/src/docs/src/archive/foo.md`).
+fn parse_paths_arg(args: &[String], docs_src: &Path) -> Result<Vec<PathBuf>, Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut i = 0_usize;
+    while i < args.len() {
+        let arg = &args[i];
+        let values: Vec<String> = if let Some(v) = arg.strip_prefix("--paths=") {
+            vec![v.to_string()]
+        } else if arg == "--paths" {
+            // Space-separated values up to the next flag; dropping them silently printed a false green.
+            let rest: Vec<String> = args[i + 1..]
+                .iter()
+                .take_while(|a| !a.starts_with("--"))
+                .cloned()
+                .collect();
+            i += rest.len();
+            rest
+        } else {
+            Vec::new()
+        };
+        for value in values {
+            for raw in value.split(',') {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let p = PathBuf::from(trimmed);
+                let resolved = if p.is_absolute() { p } else { docs_src.join(p) };
+                out.push(resolved);
+            }
+        }
+        i += 1;
+    }
+    let missing: Vec<PathBuf> = out.iter().filter(|p| !p.exists()).cloned().collect();
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        Err(missing)
+    }
+}
+
+fn try_autofix_status_draft(path: &Path) -> bool {
+    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+        return false;
+    }
+    let Ok(raw) = vox_bounded_fs::read_utf8_path_capped(path) else {
+        return false;
+    };
+    let Some(after_open) = raw.strip_prefix("---\n") else {
+        return false;
+    };
+    let Some(end) = after_open.find("\n---") else {
+        return false;
+    };
+    let frontmatter = &after_open[..end];
+    if !frontmatter.contains("status: \"draft\"") && !frontmatter.contains("status: draft") {
+        return false;
+    }
+    let updated = raw
+        .replace("status: \"draft\"", "status: \"roadmap\"")
+        .replace("status: draft", "status: roadmap");
+    if updated == raw {
+        return false;
+    }
+    fs::write(path, updated).is_ok()
+}
+
+fn collect_md_files(target: &Path, out: &mut Vec<PathBuf>) {
+    if target.is_file() {
+        if target.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(target.to_path_buf());
+        }
+        return;
+    }
+    if !target.is_dir() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(target) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_md_files(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Run the doc pipeline in-process against `root`, returning the process exit
+/// code the caller would have used (`0` success, `1` failure) instead of
+/// calling `std::process::exit` directly — so it can be called from another
+/// binary's own `main` (e.g. `vox ci pre-push`) without tearing down that
+/// process, and unit-tested without touching the real repo tree.
+///
+/// Every path read is joined under `root`; this never reads the process cwd
+/// (`std::env::current_dir` / a bare relative `Path::new("docs/src")`), which
+/// matters because `vox ci pre-push` runs this concurrently with its own
+/// heartbeat thread and must not call `std::env::set_current_dir` (a
+/// process-global mutation) to point it at the repo root.
+pub fn lint_in(root: &Path, args: &[String]) -> i32 {
+    let fix_mode = args.contains(&"--fix".to_string());
+    let corpus_mode = args
+        .windows(2)
+        .any(|w| w[0] == "--mode" && w[1] == "corpus");
+
+    // Legacy flags accepted but ignored (no longer meaningful)
+    let _check_mode = args.contains(&"--check".to_string());
+    let _lint_only = args.contains(&"--lint-only".to_string());
+
+    let docs_src = root.join("docs/src");
+    if !docs_src.exists() {
+        eprintln!("Error: docs/src/ not found under {}.", root.display());
+        return 1;
+    }
+
+    // Backlog ratchet tools. Handled before `FacetCtx::load`: seeding must work with no backlog.
+    let tool = |r: Result<String, String>| match r {
+        Ok(msg) => {
+            println!("{msg}");
+            0
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            1
+        }
+    };
+    if args.contains(&"--seed-facet-backlog".to_string()) {
+        let note = args
+            .windows(2)
+            .find(|w| w[0] == "--epoch-note")
+            .map_or("", |w| w[1].as_str());
+        return tool(facet_backlog::seed(root, note));
+    }
+    if args.contains(&"--tighten-facet-backlog".to_string()) {
+        return tool(facet_backlog::tighten(root));
+    }
+    if args.contains(&"--seed-mermaid-baseline".to_string()) {
+        return tool(mermaid_gate::seed(root));
+    }
+    if args.contains(&"--tighten-mermaid-baseline".to_string()) {
+        return tool(mermaid_gate::tighten(root));
+    }
+    if args.contains(&"--render-diagrams".to_string()) {
+        return render_manifest::run(root, args);
+    }
+    if args.contains(&"--sync-readme-frontpage".to_string()) {
+        let write = args.contains(&"--write".to_string()) || fix_mode;
+        return match lint::sync_readme_to_frontpage(root, write) {
+            Ok(changed) => {
+                if changed && !write {
+                    eprintln!(
+                        "README.md and docs/src/index.mdx are out of sync. Run with --write to sync."
+                    );
+                    1
+                } else {
+                    println!("readme-frontpage-sync OK (updated={})", changed && write);
+                    0
+                }
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                1
+            }
+        };
+    }
+    if args.contains(&"--refresh-freshness-ledger".to_string()) {
+        let ledger_path = root.join("contracts/reports/docs-freshness/ledger.v1.json");
+        let existing = crate::claims::FreshnessLedger::load_from_file(&ledger_path);
+        let head_commit = existing
+            .as_ref()
+            .map(|l| l.head_commit.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+        let ledger = crate::claims::generate_freshness_ledger(root, &head_commit, None);
+        if let Err(e) = ledger.save_to_file(&ledger_path) {
+            eprintln!("Failed to write {}: {}", ledger_path.display(), e);
+            return 1;
+        }
+        eprintln!(
+            "Freshness ledger written to {} ({} pages: {} verified, {} drifting, {} broken, {} historical, {} unanchored)",
+            ledger_path.display(),
+            ledger.metrics.total_pages,
+            ledger.metrics.verified_count,
+            ledger.metrics.drifting_count,
+            ledger.metrics.broken_count,
+            ledger.metrics.historical_count,
+            ledger.metrics.unanchored_count,
+        );
+        for (p, rec) in &ledger.pages {
+            if !rec.broken_mentions.is_empty() {
+                eprintln!("  BROKEN {} -> {:?}", p, rec.broken_mentions);
+            }
+        }
+        if let Ok(resolved) = crate::claims::scan_corpus(root, None) {
+            let findings = crate::claims::generate_findings(&resolved);
+            let baseline_path = root.join("contracts/reports/docs-freshness/baseline.v1.json");
+            if let Ok(mut baseline) = crate::claims::BaselineFile::load_from_file(&baseline_path) {
+                let active_fps: std::collections::HashSet<String> = findings
+                    .iter()
+                    .map(|f| f.fingerprint.clone().unwrap_or_else(|| f.id.clone()))
+                    .collect();
+                let removed = baseline.tighten(&active_fps);
+                let _ = baseline.save_to_file(&baseline_path);
+                eprintln!(
+                    "Tightened baseline.v1.json: removed {} resolved deficits (remaining: {})",
+                    removed,
+                    baseline.deficits.len()
+                );
+            }
+        }
+        return 0;
+    }
+
+    if corpus_mode {
+        let mut md_files = Vec::new();
+        collect_md_files(&docs_src, &mut md_files);
+        let mut corpus_output = String::new();
+        for f in md_files {
+            if let Ok(content) = vox_bounded_fs::read_utf8_path_capped(&f) {
+                let item = serde_json::json!({
+                    "path": f.to_string_lossy().to_string(),
+                    "content": content
+                });
+                corpus_output.push_str(&item.to_string());
+                corpus_output.push('\n');
+            }
+        }
+        let out_path = docs_src.join("corpus.jsonl");
+        fs::write(&out_path, corpus_output).expect("Failed to write corpus.jsonl");
+        println!("Successfully generated docs/src/corpus.jsonl");
+        return 0;
+    }
+
+    let lint_targets = match parse_paths_arg(args, &docs_src) {
+        Ok(paths) => paths,
+        Err(missing) => {
+            for p in &missing {
+                eprintln!(
+                    "Error: --paths did not match any file or directory: {}",
+                    p.display()
+                );
+            }
+            return 1;
+        }
+    };
+    if !lint_targets.is_empty() {
+        for t in &lint_targets {
+            println!("vox-doc-pipeline: linting {}", t.display());
+        }
+    }
+    if fix_mode {
+        let mut fixed = 0_usize;
+        let mut mermaid_fixed = 0_usize;
+        let try_autofix_mermaid = |path: &Path| -> bool {
+            if !path.is_file() {
+                return false;
+            }
+            let norm = path.to_string_lossy().replace('\\', "/");
+            if norm.contains("/archive/") {
+                return false;
+            }
+            let Ok(raw) = vox_bounded_fs::read_utf8_path_capped(path) else {
+                return false;
+            };
+            if !raw.contains("```mermaid") {
+                return false;
+            }
+            let (repaired, _, changed) = mermaid::validate_and_repair_markdown_mermaid(&raw);
+            if changed > 0 && repaired != raw {
+                fs::write(path, repaired).is_ok()
+            } else {
+                false
+            }
+        };
+        if lint_targets.is_empty() {
+            let mut md_files = Vec::new();
+            collect_md_files(&docs_src, &mut md_files);
+            for f in md_files {
+                if try_autofix_status_draft(&f) {
+                    fixed += 1;
+                }
+                if try_autofix_mermaid(&f) {
+                    mermaid_fixed += 1;
+                }
+            }
+        } else {
+            for t in &lint_targets {
+                if t.is_file() {
+                    if try_autofix_status_draft(t) {
+                        fixed += 1;
+                    }
+                    if try_autofix_mermaid(t) {
+                        mermaid_fixed += 1;
+                    }
+                    continue;
+                }
+                let mut md_files = Vec::new();
+                collect_md_files(t, &mut md_files);
+                for f in md_files {
+                    if try_autofix_status_draft(&f) {
+                        fixed += 1;
+                    }
+                    if try_autofix_mermaid(&f) {
+                        mermaid_fixed += 1;
+                    }
+                }
+            }
+        }
+        if let Ok(true) = lint::sync_readme_to_frontpage(root, true) {
+            eprintln!("Synced README.md blocks into docs/src/index.mdx.");
+        }
+        if fixed > 0 {
+            eprintln!("Applied {} frontmatter status auto-fix(es).", fixed);
+        }
+        if mermaid_fixed > 0 {
+            eprintln!("Applied {} Mermaid diagram auto-fix(es).", mermaid_fixed);
+        }
+    }
+
+    let mut lint_errors: Vec<LintError> = Vec::new();
+    // `--mermaid-only` (fast tier) skips everything but the whole-tree ratchet below, so a change
+    // to any extension (.md, .mdx, none) is still held to the baseline.
+    if !args.contains(&"--mermaid-only".to_string()) {
+        // Taxonomy + backlog load once, before the parallel file pass. A missing or invalid
+        // contract is one hard error (fail closed), never "no facet rules apply".
+        let facet_ctx = match facets::FacetCtx::load(root) {
+            Ok(ctx) => Some(ctx),
+            Err(issue) => {
+                lint_errors.push(LintError {
+                    file: root.to_path_buf(),
+                    line: 0,
+                    kind: LintKind::Facet(issue),
+                });
+                None
+            }
+        };
+        if lint_targets.is_empty() {
+            collect_lint_errors_target_with_root(
+                &docs_src,
+                &mut lint_errors,
+                root,
+                facet_ctx.as_ref(),
+            );
+        } else {
+            for target in &lint_targets {
+                collect_lint_errors_target_with_root(
+                    target,
+                    &mut lint_errors,
+                    root,
+                    facet_ctx.as_ref(),
+                );
+            }
+        }
+        // Always run, even in scoped mode: it's two cheap file reads (README.md,
+        // index.mdx), not a directory walk, so there's no cost reason to gate it
+        // behind an unscoped run — and gating it was the reason the local
+        // (scoped-by-default) `vox ci pre-push` never caught README<->homepage
+        // drift, only CI did.
+        lint::lint_readme_sync_paths(
+            &root.join("README.md"),
+            &docs_src.join("index.mdx"),
+            &mut lint_errors,
+        );
+    }
+    // Always scans the whole docs/src tree so files nobody changed are still held to the baseline.
+    mermaid_gate::lint(root, &mut lint_errors);
+
+    if !lint_errors.is_empty() {
+        eprintln!("\n── vox-doc-pipeline: doc lint errors ──────────────────────────────");
+        for e in &lint_errors {
+            let rel = e.file.strip_prefix(&docs_src).unwrap_or(&e.file);
+            match &e.kind {
+                LintKind::UnclosedCodeFence => {
+                    eprintln!(
+                        "  ERROR  {} — unclosed code fence (file ends with open ```)",
+                        rel.display()
+                    );
+                }
+                LintKind::ShortCodeFence { backticks, at_line } => {
+                    eprintln!(
+                        "  ERROR  {}:{} — code fence has only {} backtick(s); mdBook requires 3 (```)",
+                        rel.display(),
+                        at_line,
+                        backticks
+                    );
+                }
+                LintKind::GenericDescription => {
+                    eprintln!(
+                        "  ERROR  {} — description is the auto-generated template text; replace with a specific, hand-written description",
+                        rel.display()
+                    );
+                }
+                LintKind::MissingFrontmatter => {
+                    eprintln!(
+                        "  WARN   {} — no YAML frontmatter block; add title/description/category",
+                        rel.display()
+                    );
+                }
+                LintKind::MissingCategory => {
+                    eprintln!(
+                        "  WARN   {} — frontmatter is missing `category:`; docs nav will fall back to folder-based placement",
+                        rel.display()
+                    );
+                }
+                LintKind::MissingTrainingRationale => {
+                    eprintln!(
+                        "  ERROR  {} — `training_eligible: true` requires `training_rationale:` frontmatter on research/roadmap pages",
+                        rel.display()
+                    );
+                }
+                LintKind::UnknownCategory { value } => {
+                    eprintln!(
+                        "  ERROR  {} — unknown category {:?}.{} Valid: {}",
+                        rel.display(),
+                        value,
+                        suggestion_hint(value, lint::VALID_CATEGORIES),
+                        lint::VALID_CATEGORIES.join(" | "),
+                    );
+                }
+                LintKind::UnknownStatus { value } => {
+                    eprintln!(
+                        "  ERROR  {} — unknown status {:?}.{} Valid: {}",
+                        rel.display(),
+                        value,
+                        suggestion_hint(value, lint::VALID_STATUS),
+                        lint::VALID_STATUS.join(" | "),
+                    );
+                }
+                LintKind::UnknownSchemaType { value } => {
+                    eprintln!(
+                        "  ERROR  {} — unknown schema_type {:?}.{} Valid: {}",
+                        rel.display(),
+                        value,
+                        suggestion_hint(value, lint::VALID_SCHEMA_TYPES),
+                        lint::VALID_SCHEMA_TYPES.join(" | "),
+                    );
+                }
+                LintKind::BrokenIncludeFile { file } => {
+                    eprintln!(
+                        "  ERROR  {} — `{{{{#include {}}}}}` target file not found. The Starlight build will fail at runtime.",
+                        rel.display(),
+                        file
+                    );
+                }
+                LintKind::BrokenIncludeAnchor { file, anchor } => {
+                    eprintln!(
+                        "  ERROR  {} — unresolved anchor `:{}` in `{{{{#include ...}}}}` (target {}). Check if REGION exists in the golden file.",
+                        rel.display(),
+                        anchor,
+                        file
+                    );
+                }
+                LintKind::WholeFileIncludeHasTrainingHeader { file } => {
+                    eprintln!(
+                        "  ERROR  {} — whole-file include pulls in `// ---` training metadata from {}. Use `{{{{#include {}:display}}}}`.",
+                        rel.display(),
+                        file,
+                        file
+                    );
+                }
+                LintKind::DocTestFailed { msg } => {
+                    eprintln!("{}", msg);
+                }
+                LintKind::UnlabeledCodeFence { at_line } => {
+                    eprintln!(
+                        "  WARN   {}:{} — code fence has no language tag; add one (e.g. ```bash, ```rust, ```toml)",
+                        rel.display(),
+                        at_line,
+                    );
+                }
+                LintKind::DuplicateFrontmatter {
+                    second_block_start_line,
+                } => {
+                    eprintln!(
+                        "  ERROR  {}:{} — duplicate YAML frontmatter block (frontmatter/duplicate-block)",
+                        rel.display(),
+                        second_block_start_line,
+                    );
+                }
+                LintKind::HandAuthoredLastUpdated => {
+                    eprintln!(
+                        "  ERROR  {} — hand-authored `last_updated:` in frontmatter; the pipeline derives this from Git history (documentation-governance.md). Remove the key.",
+                        rel.display()
+                    );
+                }
+                LintKind::HandAuthoredLastVerified => {
+                    eprintln!(
+                        "  ERROR  {} — hand-authored `last_verified:` or `last_verified_commit:` in frontmatter; the pipeline derives this from the Freshness Ledger (DRIFT-02/03). Remove the key.",
+                        rel.display()
+                    );
+                }
+                LintKind::ReadmeSyncDrift { block } => {
+                    eprintln!(
+                        "  ERROR  {} — SYNC block '{}' has drifted from its README.md ANCHOR counterpart. Re-sync both, or fix the anchor if content genuinely changed.",
+                        rel.display(),
+                        block
+                    );
+                }
+                LintKind::ReadmeSyncMissingBlock { block } => {
+                    eprintln!(
+                        "  ERROR  {} — README.md has ANCHOR '{}' but index.mdx has no matching SYNC-FROM-README block.",
+                        rel.display(),
+                        block
+                    );
+                }
+                LintKind::ReadmeSyncMissingAnchor { block } => {
+                    eprintln!(
+                        "  ERROR  {} — index.mdx expects README.md ANCHOR '{}' but it's missing there.",
+                        rel.display(),
+                        block
+                    );
+                }
+                LintKind::ReadmeSyncSourceMissing { path } => {
+                    eprintln!(
+                        "  ERROR  {} — README<->index.mdx sync check could not read '{}'. The file is missing or unreadable, so drift can no longer be detected.",
+                        rel.display(),
+                        path
+                    );
+                }
+                LintKind::Facet(i) => {
+                    eprintln!(
+                        "  {}  {}:{} — {} ({})",
+                        if i.is_hard() { "ERROR" } else { "WARN " },
+                        rel.display(),
+                        e.line,
+                        i.message(),
+                        i.rule_id()
+                    );
+                }
+                LintKind::Diagram(i) => eprintln!(
+                    "  {}  {}",
+                    if i.is_hard() { "ERROR" } else { "WARN " },
+                    i.render(e.file.strip_prefix(root).unwrap_or(&e.file))
+                ),
+                LintKind::LegacyMermaid(i) => {
+                    // every legacy-Mermaid finding blocks, stale slack included (it could be re-spent)
+                    eprintln!(
+                        "  ERROR  {}:{} — {} ({})",
+                        rel.display(),
+                        e.line,
+                        i.message(),
+                        i.rule_id()
+                    );
+                }
+                LintKind::InvalidMermaid { code, msg } => {
+                    eprintln!("  ERROR  {}:{} — {} ({})", rel.display(), e.line, msg, code);
+                }
+            }
+        }
+
+        let hard_errors = lint_errors
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind, LintKind::Facet(i) if i.is_hard())
+                    || matches!(&e.kind, LintKind::Diagram(i) if i.is_hard())
+                    || matches!(&e.kind, LintKind::LegacyMermaid(_))
+                    || matches!(
+                        e.kind,
+                        LintKind::UnclosedCodeFence
+                            | LintKind::ShortCodeFence { .. }
+                            | LintKind::GenericDescription
+                            | LintKind::UnknownCategory { .. }
+                            | LintKind::UnknownStatus { .. }
+                            | LintKind::UnknownSchemaType { .. }
+                            | LintKind::BrokenIncludeFile { .. }
+                            | LintKind::BrokenIncludeAnchor { .. }
+                            | LintKind::WholeFileIncludeHasTrainingHeader { .. }
+                            | LintKind::MissingTrainingRationale
+                            | LintKind::HandAuthoredLastUpdated
+                            | LintKind::HandAuthoredLastVerified
+                            | LintKind::DocTestFailed { .. }
+                            | LintKind::DuplicateFrontmatter { .. }
+                            | LintKind::ReadmeSyncDrift { .. }
+                            | LintKind::ReadmeSyncMissingBlock { .. }
+                            | LintKind::ReadmeSyncMissingAnchor { .. }
+                            | LintKind::ReadmeSyncSourceMissing { .. }
+                            | LintKind::InvalidMermaid { .. }
+                    )
+            })
+            .count();
+        print_grouped_summary(&lint_errors);
+
+        if hard_errors > 0 {
+            eprintln!(
+                "\n{} hard error(s) — fix before building docs.",
+                hard_errors
+            );
+            return 1;
+        }
+        eprintln!();
+    }
+
+    println!("vox-doc-pipeline lint complete — no hard errors.");
+    0
+}
+
+/// Run the doc pipeline: lint source markdown and optionally export corpus.
+///
+/// SUMMARY.md and feed.xml are no longer generated here — the Starlight site
+/// builds the sidebar and RSS from frontmatter directly at Astro build time.
+pub fn run() {
+    std::process::exit(lint_in(
+        Path::new("."),
+        &std::env::args().collect::<Vec<_>>(),
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_paths_arg_nonexistent_is_error() {
+        let docs_src = Path::new("/tmp/vox-doc-pipeline-paths-test-docs-src");
+        let args = [
+            "vox-doc-pipeline".to_string(),
+            "--paths".to_string(),
+            "does-not-exist.md".to_string(),
+        ];
+        let err = parse_paths_arg(&args, docs_src)
+            .expect_err("nonexistent --paths value must be an error");
+        assert_eq!(err.len(), 1);
+        assert!(
+            err[0].ends_with("does-not-exist.md"),
+            "unmatched path should be listed, got {:?}",
+            err
+        );
+        assert!(!err[0].exists());
+    }
+
+    #[test]
+    fn parse_paths_arg_takes_space_separated_values_until_next_flag() {
+        let docs_src = fixture_root().join("docs/src");
+        for f in ["a.md", "b.md", "c.md"] {
+            std::fs::write(docs_src.join(f), "x").expect("write");
+        }
+        let args: Vec<String> = [
+            "vox-doc-pipeline",
+            "--paths",
+            "a.md",
+            "b.md,c.md",
+            "--lint-only",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let paths = parse_paths_arg(&args, &docs_src).expect("all exist");
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Silently dropping b.md/c.md used to print a false "no hard errors".
+        assert_eq!(names, ["a.md", "b.md", "c.md"]);
+    }
+
+    #[test]
+    fn parse_paths_arg_absent_flag_is_ok_empty() {
+        let docs_src = Path::new("/tmp/vox-doc-pipeline-paths-test-docs-src");
+        let args = ["vox-doc-pipeline".to_string(), "--lint-only".to_string()];
+        let paths = parse_paths_arg(&args, docs_src).expect("no --paths is not an error");
+        assert!(paths.is_empty());
+    }
+
+    fn fixture_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "vox-doc-lint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(root.join("docs/src")).unwrap();
+        write_facet_contracts(&root, " []");
+        root
+    }
+
+    /// Write a README.md `<!-- ANCHOR: why_vox -->` block and a matching
+    /// `docs/src/index.mdx` (valid frontmatter + `SYNC-FROM-README: why_vox`
+    /// block) under `root`, in the exact marker shapes
+    /// `lint::lint_readme_sync_paths` / `readme_anchor` / `mdx_sync_block`
+    /// expect (`why_vox` is the sole entry in `lint::SYNCED_BLOCKS`).
+    pub(super) fn write_readme_sync_fixture(root: &Path, readme_body: &str, mdx_body: &str) {
+        std::fs::write(
+            root.join("README.md"),
+            format!("<!-- ANCHOR: why_vox -->\n{readme_body}\n<!-- ANCHOR_END: why_vox -->\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docs/src/index.mdx"),
+            format!(
+                "---\ntitle: \"Index\"\ndescription: \"Test fixture index page for lint_in tests.\"\ncategory: \"Concepts\"\n---\n\n{{/* SYNC-FROM-README: why_vox */}}\n{mdx_body}\n{{/* SYNC-END: why_vox */}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lint_in_reports_missing_paths_without_exiting() {
+        let root = fixture_root();
+        assert_eq!(lint_in(&root, &["--paths=nope.md".to_string()]), 1);
+    }
+
+    #[test]
+    fn lint_in_reads_readme_sync_under_root_not_cwd() {
+        // In-sync pair under `root` must lint clean (a cwd-reading lint_in fails here:
+        // cargo's cwd is crates/vox-doc-pipeline, which has no docs/src).
+        let root = fixture_root();
+        write_readme_sync_fixture(&root, "Same text.", "Same text.");
+        assert_eq!(lint_in(&root, &["--paths=index.mdx".to_string()]), 0);
+        // Drift under `root` must be reported.
+        write_readme_sync_fixture(&root, "Same text.", "Different text.");
+        assert_ne!(lint_in(&root, &["--paths=index.mdx".to_string()]), 0);
+    }
+
+    const FACET_TAXONOMY: &str =
+        include_str!("../../../../contracts/documentation/kb-taxonomy.v1.yaml");
+
+    pub(super) fn write_facet_contracts(root: &Path, backlog_docs: &str) {
+        let c = root.join("contracts/documentation");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("kb-taxonomy.v1.yaml"), FACET_TAXONOMY).unwrap();
+        std::fs::write(
+            c.join("kb-facet-backlog.v1.yaml"),
+            format!("schema_version: 1\nepoch: 1\nepoch_note: test fixture\ndocs:{backlog_docs}\n"),
+        )
+        .unwrap();
+    }
+
+    pub(super) const BASE_FM: &str = "title: \"Doc\"\ndescription: \"A specific hand-written description for this fixture page.\"\ncategory: \"Concepts\"";
+
+    #[test]
+    fn lint_in_facet_backlog_tracer() {
+        let root = fixture_root();
+        write_readme_sync_fixture(&root, "Same text.", "Same text.");
+        write_facet_contracts(
+            &root,
+            "\n  - path: docs/src/old.md\n    rules: [facet-missing-authorship, facet-missing-domain, facet-missing-summary, facet-missing-topic]",
+        );
+        let bare = format!("---\n{BASE_FM}\n---\n# Doc\n\nbody\n");
+        std::fs::write(root.join("docs/src/old.md"), &bare).unwrap();
+        std::fs::write(root.join("docs/src/new.md"), &bare).unwrap();
+        let words = vec!["word"; 40].join(" ");
+        std::fs::write(
+            root.join("docs/src/good.md"),
+            format!(
+                "---\n{BASE_FM}\ntopic: search-retrieval\ndomain: knowledge\nauthorship: human\n---\n# Doc\n\n<!-- kb:summary -->\n{words}\n<!-- /kb:summary -->\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(lint_in(&root, &["--paths=old.md".to_string()]), 0);
+        assert_eq!(lint_in(&root, &["--paths=new.md".to_string()]), 1);
+        assert_eq!(lint_in(&root, &["--paths=good.md".to_string()]), 0);
+    }
+
+    #[test]
+    fn missing_contract_is_one_hard_error() {
+        let root = fixture_root();
+        write_readme_sync_fixture(&root, "Same text.", "Same text.");
+        std::fs::write(
+            root.join("docs/src/a.md"),
+            format!("---\n{BASE_FM}\n---\n# A\n"),
+        )
+        .unwrap();
+        write_facet_contracts(&root, " []");
+        std::fs::remove_file(root.join("contracts/documentation/kb-taxonomy.v1.yaml")).unwrap();
+        let err = facets::FacetCtx::load(&root)
+            .err()
+            .expect("load must fail without the taxonomy");
+        assert_eq!(err.rule_id(), "facet-contract-unreadable");
+        assert_eq!(lint_in(&root, &["--paths=a.md".to_string()]), 1);
+        // an unreadable backlog fails the same way
+        write_facet_contracts(&root, " []");
+        std::fs::remove_file(root.join("contracts/documentation/kb-facet-backlog.v1.yaml"))
+            .unwrap();
+        assert_eq!(lint_in(&root, &["--paths=a.md".to_string()]), 1);
+    }
+
+    #[test]
+    fn stale_backlog_entry_warns_but_exits_zero() {
+        let root = fixture_root();
+        write_readme_sync_fixture(&root, "Same text.", "Same text.");
+        write_facet_contracts(
+            &root,
+            "\n  - path: docs/src/good.md\n    rules: [facet-missing-topic]",
+        );
+        let words = vec!["word"; 40].join(" ");
+        std::fs::write(
+            root.join("docs/src/good.md"),
+            format!(
+                "---\n{BASE_FM}\ntopic: search-retrieval\ndomain: knowledge\nauthorship: human\n---\n# Doc\n\n<!-- kb:summary -->\n{words}\n<!-- /kb:summary -->\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(lint_in(&root, &["--paths=good.md".to_string()]), 0);
+    }
+
+    #[test]
+    fn empty_backlog_holds_every_doc() {
+        let root = fixture_root();
+        write_readme_sync_fixture(&root, "Same text.", "Same text.");
+        write_facet_contracts(&root, " []");
+        std::fs::write(
+            root.join("docs/src/a.md"),
+            format!("---\n{BASE_FM}\n---\n# A\n"),
+        )
+        .unwrap();
+        assert_eq!(lint_in(&root, &["--paths=a.md".to_string()]), 1);
+    }
+}
