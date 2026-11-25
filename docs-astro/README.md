@@ -33,7 +33,8 @@
     <a href="https://voxlang.org"><strong>voxlang.org</strong></a> &nbsp;·&nbsp;
     <a href="https://eval.voxlang.org/health"><strong>eval.voxlang.org</strong></a> &nbsp;·&nbsp;
     <a href="https://github.com/vox-foundation/vox"><strong>vox-foundation/vox (Language &amp; Compiler)</strong></a> &nbsp;·&nbsp;
-    <a href="https://github.com/vox-foundation/vox-axis"><strong>vox-foundation/vox-axis (Desktop GUI)</strong></a>
+    <a href="https://github.com/vox-foundation/vox-axis"><strong>vox-foundation/vox-axis (Desktop GUI)</strong></a> &nbsp;·&nbsp;
+    <a href="https://huggingface.co/brbrainerd/vox-mens-index"><strong>Vox Mens (Hugging Face)</strong></a>
   </p>
 
   <p>
